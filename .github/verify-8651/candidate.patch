@@ -1,0 +1,1020 @@
+diff --git a/shenyu-admin/src/main/java/org/apache/shenyu/admin/mapper/ApiMapper.java b/shenyu-admin/src/main/java/org/apache/shenyu/admin/mapper/ApiMapper.java
+index 38f655c..855e2a4 100644
+--- a/shenyu-admin/src/main/java/org/apache/shenyu/admin/mapper/ApiMapper.java
++++ b/shenyu-admin/src/main/java/org/apache/shenyu/admin/mapper/ApiMapper.java
+@@ -120,6 +120,15 @@ public interface ApiMapper extends ExistProvider {
+      */
+     List<ApiDO> selectByApiPathHttpMethodRpcType(@Param(value = "apiPath") String apiPath, @Param(value = "httpMethod") Integer httpMethod, @Param(value = "rpcType") String rpcType);
+ 
++    /**
++     * Lock the APIs that share a path and RPC type.
++     *
++     * @param apiPath API path
++     * @param rpcType RPC type
++     * @return IDs of matching registrations
++     */
++    List<String> lockIdsByPathAndRpcType(@Param("apiPath") String apiPath, @Param("rpcType") String rpcType);
++
+     /**
+      * updateOfflineByContextPath.
+      * @param contextPath context path
+diff --git a/shenyu-admin/src/main/java/org/apache/shenyu/admin/service/ApiService.java b/shenyu-admin/src/main/java/org/apache/shenyu/admin/service/ApiService.java
+index c7deda6..c4c3d0a 100644
+--- a/shenyu-admin/src/main/java/org/apache/shenyu/admin/service/ApiService.java
++++ b/shenyu-admin/src/main/java/org/apache/shenyu/admin/service/ApiService.java
+@@ -24,6 +24,7 @@ import org.apache.shenyu.admin.model.vo.ApiVO;
+ import org.apache.shenyu.admin.model.vo.PluginVO;
+ 
+ import java.util.List;
++import java.util.Set;
+ 
+ /**
+  * this is api service.
+@@ -38,6 +39,23 @@ public interface ApiService {
+      */
+     String createOrUpdate(ApiDTO apiDTO);
+ 
++    /**
++     * Refresh an existing Swagger document without recreating its gateway configuration.
++     *
++     * @param apiDTO imported document
++     * @return whether an existing operation was refreshed
++     */
++    boolean refreshSwaggerDocument(ApiDTO apiDTO);
++
++    /**
++     * Remove a legacy GET document that represented a group of non-GET operations.
++     *
++     * @param contextPath import context
++     * @param apiPath imported path
++     * @param methods methods successfully registered for the path
++     */
++    void removeLegacyOpenApiGet(String contextPath, String apiPath, Set<Integer> methods);
++
+     /**
+      * Delete string.
+      *
+diff --git a/shenyu-admin/src/main/java/org/apache/shenyu/admin/service/impl/ApiServiceImpl.java b/shenyu-admin/src/main/java/org/apache/shenyu/admin/service/impl/ApiServiceImpl.java
+index 7199e11..811f9fe 100644
+--- a/shenyu-admin/src/main/java/org/apache/shenyu/admin/service/impl/ApiServiceImpl.java
++++ b/shenyu-admin/src/main/java/org/apache/shenyu/admin/service/impl/ApiServiceImpl.java
+@@ -42,7 +42,10 @@ import org.apache.shenyu.admin.model.vo.ApiVO;
+ import org.apache.shenyu.admin.model.vo.RuleVO;
+ import org.apache.shenyu.admin.model.vo.TagVO;
+ import org.apache.shenyu.admin.service.ApiService;
++import org.apache.shenyu.common.enums.ApiHttpMethodEnum;
++import org.apache.shenyu.common.enums.ApiSourceEnum;
+ import org.apache.shenyu.common.enums.PluginEnum;
++import org.apache.shenyu.common.enums.RpcTypeEnum;
+ import org.apache.shenyu.common.utils.JsonUtils;
+ import org.apache.shenyu.common.utils.ListUtil;
+ import org.apache.shenyu.admin.service.MetaDataService;
+@@ -59,10 +62,14 @@ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.annotation.Transactional;
+ 
+ import java.sql.Timestamp;
++import java.util.Arrays;
++import java.util.HashSet;
+ import java.util.List;
++import java.util.Locale;
+ import java.util.Map;
+ import java.util.Collections;
+ import java.util.Optional;
++import java.util.Set;
+ import java.util.function.BiConsumer;
+ import java.util.stream.Collectors;
+ 
+@@ -106,6 +113,73 @@ public class ApiServiceImpl implements ApiService {
+         return StringUtils.isBlank(apiDTO.getId()) ? this.create(apiDTO) : this.update(apiDTO);
+     }
+ 
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public boolean refreshSwaggerDocument(final ApiDTO apiDTO) {
++        List<ApiDO> operations = apiMapper.selectByApiPathHttpMethodRpcType(
++                apiDTO.getApiPath(), apiDTO.getHttpMethod(), apiDTO.getRpcType());
++        if (CollectionUtils.isEmpty(operations)) {
++            return false;
++        }
++        ApiDO document = ApiDO.buildApiDO(apiDTO);
++        document.setState(null);
++        document.setApiOwner(null);
++        document.setApiSource(null);
++        document.setDateCreated(null);
++        int updatedRows = 0;
++        for (ApiDO operation : operations) {
++            document.setId(operation.getId());
++            updatedRows += apiMapper.updateByPrimaryKeySelective(document);
++        }
++        if (updatedRows > 0) {
++            // Ensure defaults still exist without replacing the current route.
++            register(document);
++        }
++        return updatedRows > 0;
++    }
++
++    @Override
++    @Transactional(rollbackFor = Exception.class)
++    public void removeLegacyOpenApiGet(final String contextPath, final String apiPath, final Set<Integer> methods) {
++        if (methods.size() < 2 || methods.contains(ApiHttpMethodEnum.GET.getValue())) {
++            return;
++        }
++        List<String> pathIds = apiMapper.lockIdsByPathAndRpcType(apiPath, RpcTypeEnum.HTTP.getName());
++        if (CollectionUtils.isEmpty(pathIds)) {
++            return;
++        }
++        List<ApiDO> documents = apiMapper.selectByIds(pathIds).stream()
++                .filter(api -> Objects.equals(contextPath, api.getContextPath()))
++                .filter(api -> Objects.equals(ApiSourceEnum.SWAGGER.getValue(), api.getApiSource()))
++                .toList();
++        Set<Integer> persistedMethods = documents.stream().map(ApiDO::getHttpMethod).collect(Collectors.toSet());
++        if (!persistedMethods.containsAll(methods)) {
++            return;
++        }
++        Set<String> methodNames = Arrays.stream(ApiHttpMethodEnum.values())
++                .filter(method -> methods.contains(method.getValue()))
++                .map(method -> method.getName().toLowerCase(Locale.ROOT))
++                .collect(Collectors.toSet());
++        List<String> staleIds = documents.stream()
++                .filter(api -> Objects.equals(ApiHttpMethodEnum.GET.getValue(), api.getHttpMethod()))
++                .filter(api -> isLegacyOpenApiGet(api.getDocument(), methodNames))
++                .map(ApiDO::getId)
++                .toList();
++        if (CollectionUtils.isNotEmpty(staleIds) && apiMapper.deleteByIds(staleIds) > 0) {
++            // These are document rows; their shared gateway configuration belongs to the imported methods.
++            tagRelationMapper.deleteByApiIds(staleIds);
++        }
++    }
++
++    private boolean isLegacyOpenApiGet(final String content, final Set<String> methods) {
++        if (StringUtils.isBlank(content)) {
++            return false;
++        }
++        DocItem doc = JsonUtils.jsonToObject(content, DocItem.class);
++        return Objects.nonNull(doc) && CollectionUtils.isNotEmpty(doc.getHttpMethodList())
++                && new HashSet<>(doc.getHttpMethodList()).equals(methods);
++    }
++
+     /**
+      * update.
+      *
+@@ -166,10 +240,25 @@ public class ApiServiceImpl implements ApiService {
+         return ShenyuResultMessage.CREATE_SUCCESS;
+     }
+ 
++    private void lockHttpPathsForDeletion(final List<ApiDO> apis) {
++        // Lock shared paths before deleting individual rows, in the same order for all batches.
++        apis.stream()
++                .filter(api -> RpcTypeEnum.HTTP.getName().equals(api.getRpcType()))
++                .map(ApiDO::getApiPath)
++                .distinct()
++                .sorted()
++                .forEach(path -> apiMapper.lockIdsByPathAndRpcType(path, RpcTypeEnum.HTTP.getName()));
++    }
++
+     private void removeRegister(final ApiDO apiDO,
+                                 final BiConsumer<List<String>, String> ruleRemover,
+                                 final BiConsumer<List<String>, String> selectorRemover) {
+         final String path = apiDO.getApiPath();
++        // HTTP methods share the route named by the path.
++        if (RpcTypeEnum.HTTP.getName().equals(apiDO.getRpcType())
++                && CollectionUtils.isNotEmpty(apiMapper.lockIdsByPathAndRpcType(path, apiDO.getRpcType()))) {
++            return;
++        }
+         RuleQueryCondition condition = new RuleQueryCondition();
+         condition.setKeyword(path);
+         //clean rule
+@@ -245,7 +334,7 @@ public class ApiServiceImpl implements ApiService {
+         if (CollectionUtils.isEmpty(apis)) {
+             return AdminConstants.SYS_API_ID_NOT_EXIST;
+         }
+-        // delete apis.
++        lockHttpPathsForDeletion(apis);
+         final List<String> apiIds = ListUtil.map(apis, ApiDO::getId);
+         final int deleteRows = this.apiMapper.deleteByIds(apiIds);
+         if (deleteRows > 0) {
+@@ -302,10 +391,11 @@ public class ApiServiceImpl implements ApiService {
+     }
+ 
+     @Override
++    @Transactional(rollbackFor = Exception.class)
+     public int deleteByApiPathHttpMethodRpcType(final String apiPath, final Integer httpMethod, final String rpcType) {
+         List<ApiDO> apiDOs = apiMapper.selectByApiPathHttpMethodRpcType(apiPath, httpMethod, rpcType);
+-        // delete apis.
+         if (CollectionUtils.isNotEmpty(apiDOs)) {
++            lockHttpPathsForDeletion(apiDOs);
+             final List<String> apiIds = ListUtil.map(apiDOs, ApiDO::getId);
+             final int deleteRows = this.apiMapper.deleteByIds(apiIds);
+             if (deleteRows > 0) {
+diff --git a/shenyu-admin/src/main/java/org/apache/shenyu/admin/service/manager/RegisterApiDocService.java b/shenyu-admin/src/main/java/org/apache/shenyu/admin/service/manager/RegisterApiDocService.java
+index a232980..e9e9d78 100644
+--- a/shenyu-admin/src/main/java/org/apache/shenyu/admin/service/manager/RegisterApiDocService.java
++++ b/shenyu-admin/src/main/java/org/apache/shenyu/admin/service/manager/RegisterApiDocService.java
+@@ -19,6 +19,8 @@ package org.apache.shenyu.admin.service.manager;
+ 
+ import org.apache.shenyu.register.common.dto.ApiDocRegisterDTO;
+ 
++import java.util.Set;
++
+ /**
+  * register api document manager.
+  */
+@@ -29,4 +31,13 @@ public interface RegisterApiDocService {
+      * @param apiDocRegisterDTO apiDocRegisterDTO
+      */
+     void registerApiDocument(ApiDocRegisterDTO apiDocRegisterDTO);
++
++    /**
++     * Remove the historical GET placeholder, if the imported methods replaced it.
++     *
++     * @param contextPath import context
++     * @param apiPath imported path
++     * @param methods imported method IDs
++     */
++    void removeLegacyOpenApiGet(String contextPath, String apiPath, Set<Integer> methods);
+ }
+diff --git a/shenyu-admin/src/main/java/org/apache/shenyu/admin/service/manager/impl/DocManagerImpl.java b/shenyu-admin/src/main/java/org/apache/shenyu/admin/service/manager/impl/DocManagerImpl.java
+index 6d9f6fc..90f99bb 100644
+--- a/shenyu-admin/src/main/java/org/apache/shenyu/admin/service/manager/impl/DocManagerImpl.java
++++ b/shenyu-admin/src/main/java/org/apache/shenyu/admin/service/manager/impl/DocManagerImpl.java
+@@ -20,9 +20,14 @@ package org.apache.shenyu.admin.service.manager.impl;
+ import java.nio.charset.StandardCharsets;
+ import java.util.Collection;
+ import java.util.Collections;
++import java.util.HashSet;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Locale;
++import java.util.Map;
+ import java.util.Objects;
+ import java.util.Optional;
++import java.util.Set;
+ import java.util.function.Consumer;
+ 
+ import com.google.gson.JsonObject;
+@@ -90,6 +95,7 @@ public class DocManagerImpl implements DocManager {
+         }
+         docInfo.setDocMd5(newMd5);
+ 
++        Map<String, Set<Integer>> importedMethods = new LinkedHashMap<>();
+         List<DocModule> docModules = docInfo.getDocModuleList();
+         docModules.forEach(docModule -> docModule.getDocItems().forEach(docItem -> {
+             ApiDocRegisterDTO build = ApiDocRegisterDTO.builder()
+@@ -111,7 +117,16 @@ public class DocManagerImpl implements DocManager {
+                 .build();
+ 
+             registerApiDocService.registerApiDocument(build);
++            if (docItem.getHttpMethodList().size() == 1) {
++                importedMethods.computeIfAbsent(build.getApiPath(), ignored -> new HashSet<>()).add(build.getHttpMethod());
++            }
+         }));
++        // Swagger 2.0 emits one item per path and never enters this cleanup.
++        importedMethods.forEach((path, methods) -> {
++            if (methods.size() > 1 && !methods.contains(ApiHttpMethodEnum.GET.getValue())) {
++                registerApiDocService.removeLegacyOpenApiGet(docInfo.getContextPath(), path, methods);
++            }
++        });
+ 
+         callback.accept(docInfo);
+     }
+@@ -131,7 +146,7 @@ public class DocManagerImpl implements DocManager {
+         Integer httpMethod = null;
+         Optional<String> first = docItem.getHttpMethodList().stream().findFirst();
+         if (first.isPresent()) {
+-            String method = docItem.getHttpMethodList().size() == 1 ? StringUtils.upperCase(first.get()) : ApiHttpMethodEnum.GET.getName();
++            String method = docItem.getHttpMethodList().size() == 1 ? StringUtils.upperCase(first.get(), Locale.ROOT) : ApiHttpMethodEnum.GET.getName();
+             httpMethod = ApiHttpMethodEnum.getValueByName(method);
+         }
+         return httpMethod;
+diff --git a/shenyu-admin/src/main/java/org/apache/shenyu/admin/service/manager/impl/RegisterApiDocServiceImpl.java b/shenyu-admin/src/main/java/org/apache/shenyu/admin/service/manager/impl/RegisterApiDocServiceImpl.java
+index 6907690..78a03f0 100644
+--- a/shenyu-admin/src/main/java/org/apache/shenyu/admin/service/manager/impl/RegisterApiDocServiceImpl.java
++++ b/shenyu-admin/src/main/java/org/apache/shenyu/admin/service/manager/impl/RegisterApiDocServiceImpl.java
+@@ -20,6 +20,8 @@ package org.apache.shenyu.admin.service.manager.impl;
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.List;
++import java.util.Objects;
++import java.util.Set;
+ import java.util.stream.Collectors;
+ import jakarta.annotation.Resource;
+ import org.apache.commons.collections4.CollectionUtils;
+@@ -29,6 +31,7 @@ import org.apache.shenyu.admin.model.vo.TagVO;
+ import org.apache.shenyu.admin.service.ApiService;
+ import org.apache.shenyu.admin.service.TagService;
+ import org.apache.shenyu.admin.service.manager.RegisterApiDocService;
++import org.apache.shenyu.common.enums.ApiSourceEnum;
+ import org.apache.shenyu.common.utils.UUIDUtils;
+ import org.apache.shenyu.register.common.dto.ApiDocRegisterDTO;
+ import org.apache.shenyu.register.common.enums.EventType;
+@@ -53,7 +56,13 @@ public class RegisterApiDocServiceImpl implements RegisterApiDocService {
+     public void registerApiDocument(final ApiDocRegisterDTO apiDocRegisterDTO) {
+         if (EventType.REGISTER == apiDocRegisterDTO.getEventType()) {
+             ApiDTO apiDTO = buildApiDTO(apiDocRegisterDTO);
+-            apiService.deleteByApiPathHttpMethodRpcType(apiDTO.getApiPath(), apiDTO.getHttpMethod(), apiDTO.getRpcType());
++            if (Objects.equals(ApiSourceEnum.SWAGGER.getValue(), apiDTO.getApiSource())) {
++                if (apiService.refreshSwaggerDocument(apiDTO)) {
++                    return;
++                }
++            } else {
++                apiService.deleteByApiPathHttpMethodRpcType(apiDTO.getApiPath(), apiDTO.getHttpMethod(), apiDTO.getRpcType());
++            }
+             List<String> tagsIds = new ArrayList<>();
+             List<String> tags = Collections.singletonList(apiDocRegisterDTO.getContextPath());
+             if (CollectionUtils.isNotEmpty(apiDocRegisterDTO.getTags())) {
+@@ -81,6 +90,11 @@ public class RegisterApiDocServiceImpl implements RegisterApiDocService {
+         }
+     }
+ 
++    @Override
++    public void removeLegacyOpenApiGet(final String contextPath, final String apiPath, final Set<Integer> methods) {
++        apiService.removeLegacyOpenApiGet(contextPath, apiPath, methods);
++    }
++
+     private ApiDTO buildApiDTO(final ApiDocRegisterDTO apiDocRegisterDTO) {
+         ApiDTO apiDTO = new ApiDTO();
+         apiDTO.setApiPath(apiDocRegisterDTO.getApiPath());
+diff --git a/shenyu-admin/src/main/java/org/apache/shenyu/admin/service/manager/impl/SwaggerDocParser.java b/shenyu-admin/src/main/java/org/apache/shenyu/admin/service/manager/impl/SwaggerDocParser.java
+index 2171b50..b99ff32 100755
+--- a/shenyu-admin/src/main/java/org/apache/shenyu/admin/service/manager/impl/SwaggerDocParser.java
++++ b/shenyu-admin/src/main/java/org/apache/shenyu/admin/service/manager/impl/SwaggerDocParser.java
+@@ -17,7 +17,6 @@
+ 
+ package org.apache.shenyu.admin.service.manager.impl;
+ 
+-import com.google.common.collect.Sets;
+ import com.google.gson.JsonArray;
+ import com.google.gson.JsonElement;
+ import com.google.gson.JsonObject;
+@@ -31,15 +30,18 @@ import org.apache.shenyu.admin.model.bean.DocModule;
+ import org.apache.shenyu.admin.model.bean.DocParameter;
+ import org.apache.shenyu.admin.service.manager.DocParser;
+ import org.apache.shenyu.common.constant.Constants;
++import org.apache.shenyu.common.enums.ApiHttpMethodEnum;
+ import org.apache.shenyu.common.enums.SwaggerVersion;
+ import org.apache.shenyu.common.utils.GsonUtils;
+ 
+ import java.net.URL;
+ import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.Collection;
+ import java.util.Collections;
+ import java.util.Comparator;
+ import java.util.List;
++import java.util.Locale;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.Optional;
+@@ -51,6 +53,12 @@ import java.util.stream.Collectors;
+  */
+ public class SwaggerDocParser implements DocParser {
+ 
++    private static final String BASE_PATH_KEY = "basePath";
++
++    private static final String REF_KEY = "$ref";
++
++    private static final String TYPE_KEY = "type";
++
+     /**
+      * parseJson.
+      *
+@@ -70,26 +78,26 @@ public class SwaggerDocParser implements DocParser {
+         if (Objects.isNull(paths)) {
+             paths = new JsonObject();
+         }
+-        Set<String> pathNameSet = paths.keySet();
+-        for (String apiPath : pathNameSet) {
++        for (String apiPath : paths.keySet()) {
+             JsonObject pathInfo = paths.getAsJsonObject(apiPath);
+-            Collection<String> httpMethodList = getHttpMethods(pathInfo);
+-            Optional<String> first = httpMethodList.stream().findFirst();
+-            if (first.isPresent()) {
+-                String method = first.get();
+-                JsonObject docInfo = pathInfo.getAsJsonObject(method);
+-                docInfo.addProperty("real_req_path", apiPath);
+-                docInfo.addProperty("basePath", basePath);
+-                DocItem docItem = buildDocItem(docInfo, docRoot, version);
+-                if (Objects.isNull(docItem)) {
+-                    continue;
+-                }
+-                if (docItem.isUploadRequest()) {
+-                    docItem.setHttpMethodList(Sets.newHashSet("post"));
+-                } else {
+-                    docItem.setHttpMethodList(httpMethodList);
++            Collection<String> methods = getHttpMethods(pathInfo);
++            if (version == SwaggerVersion.V2) {
++                // Keep Swagger 2.0's registration keys, including its historical upload mapping.
++                methods.stream().findFirst().ifPresent(method -> {
++                    DocItem docItem = buildOperation(pathInfo.getAsJsonObject(method), apiPath, basePath, docRoot, version);
++                    if (Objects.nonNull(docItem)) {
++                        docItem.setHttpMethodList(docItem.isUploadRequest() ? Collections.singleton("post") : methods);
++                        docItems.add(docItem);
++                    }
++                });
++                continue;
++            }
++            for (String method : methods) {
++                DocItem docItem = buildOperation(pathInfo.getAsJsonObject(method), apiPath, basePath, docRoot, version);
++                if (Objects.nonNull(docItem)) {
++                    docItem.setHttpMethodList(Collections.singleton(method));
++                    docItems.add(docItem);
+                 }
+-                docItems.add(docItem);
+             }
+         }
+ 
+@@ -116,6 +124,13 @@ public class SwaggerDocParser implements DocParser {
+         return docInfo;
+     }
+ 
++    private DocItem buildOperation(final JsonObject operation, final String apiPath, final String basePath,
++                                   final JsonObject docRoot, final SwaggerVersion version) {
++        operation.addProperty("real_req_path", apiPath);
++        operation.addProperty(BASE_PATH_KEY, basePath);
++        return buildDocItem(operation, docRoot, version);
++    }
++
+     private int getMuduleOrder(final List<DocItem> items) {
+         if (CollectionUtils.isEmpty(items)) {
+             return Integer.MAX_VALUE;
+@@ -126,15 +141,17 @@ public class SwaggerDocParser implements DocParser {
+     }
+ 
+     protected Collection<String> getHttpMethods(final JsonObject pathInfo) {
+-        Set<String> httpMethodList = pathInfo.keySet();
+-        List<String> retList = new ArrayList<>(httpMethodList);
+-        Collections.sort(retList);
+-        return retList;
++        return Arrays.stream(ApiHttpMethodEnum.values())
++                .filter(method -> method != ApiHttpMethodEnum.NOT_HTTP)
++                .map(method -> method.getName().toLowerCase(Locale.ROOT))
++                .filter(pathInfo::has)
++                .sorted()
++                .collect(Collectors.toList());
+     }
+ 
+     protected DocItem buildDocItem(final JsonObject docInfo, final JsonObject docRoot, final SwaggerVersion version) {
+         String operationPath = docInfo.get("real_req_path").getAsString();
+-        String basePath = docInfo.get("basePath").getAsString();
++        String basePath = docInfo.get(BASE_PATH_KEY).getAsString();
+         String apiName = basePath.endsWith(Constants.PATH_SEPARATOR) && operationPath.startsWith(Constants.PATH_SEPARATOR)
+                 ? basePath.substring(0, basePath.length() - 1) + operationPath : basePath + operationPath;
+ 
+@@ -188,23 +205,35 @@ public class SwaggerDocParser implements DocParser {
+         
+         for (int i = 0; i < parameters.size(); i++) {
+             JsonObject fieldJson = parameters.get(i).getAsJsonObject();
++            final boolean referenced = fieldJson.has(REF_KEY);
++            if (referenced) {
++                fieldJson = resolveLocalParameter(fieldJson.get(REF_KEY).getAsString(), docRoot, version);
++                if (Objects.isNull(fieldJson) || !fieldJson.has("name")) {
++                    continue;
++                }
++            }
+             JsonObject schema = fieldJson.getAsJsonObject("schema");
+-            
+             if (Objects.nonNull(schema)) {
+                 RefInfo refInfo = getRefInfo(schema, version);
+                 if (Objects.nonNull(refInfo)) {
+                     List<DocParameter> parameterList = this.buildDocParameters(refInfo.ref, docRoot, true, version);
+                     docRequestParameterList.addAll(parameterList);
++                    continue;
+                 }
+-            } else {
+-                DocParameter docParameter = GsonUtils.getInstance().fromJson(fieldJson, DocParameter.class);
+-                JsonElement inElement = fieldJson.get("in");
+-                if (Objects.nonNull(inElement) && "header".equals(inElement.getAsString())) {
+-                    docHeaderParameterList.add(docParameter);
+-                } else {
+-                    docRequestParameterList.add(docParameter);
++                if (!referenced) {
++                    continue;
+                 }
+             }
++            DocParameter docParameter = GsonUtils.getInstance().fromJson(fieldJson, DocParameter.class);
++            if (Objects.nonNull(schema) && schema.has(TYPE_KEY)) {
++                docParameter.setType(schema.get(TYPE_KEY).getAsString());
++            }
++            JsonElement inElement = fieldJson.get("in");
++            if (Objects.nonNull(inElement) && "header".equals(inElement.getAsString())) {
++                docHeaderParameterList.add(docParameter);
++            } else {
++                docRequestParameterList.add(docParameter);
++            }
+         }
+ 
+         Map<String, List<DocParameter>> collect = docRequestParameterList.stream()
+@@ -237,6 +266,21 @@ public class SwaggerDocParser implements DocParser {
+         docItem.setRequestHeaders(docHeaderParameterList);
+     }
+ 
++    private JsonObject resolveLocalParameter(final String reference, final JsonObject docRoot, final SwaggerVersion version) {
++        final String prefix = version == SwaggerVersion.V2 ? "#/parameters/" : "#/components/parameters/";
++        if (!reference.startsWith(prefix)) {
++            return null;
++        }
++        final JsonObject container = version == SwaggerVersion.V2 ? docRoot : docRoot.getAsJsonObject("components");
++        final JsonObject parameters = Objects.isNull(container) ? null : container.getAsJsonObject("parameters");
++        if (Objects.isNull(parameters)) {
++            return null;
++        }
++        final String name = reference.substring(prefix.length()).replace("~1", Constants.PATH_SEPARATOR).replace("~0", "~");
++        final JsonElement parameter = parameters.get(name);
++        return Objects.nonNull(parameter) && parameter.isJsonObject() ? parameter.getAsJsonObject() : null;
++    }
++
+     protected List<DocParameter> buildResponseParameterList(final JsonObject docInfo, 
+                                                           final JsonObject docRoot, 
+                                                           final SwaggerVersion version) {
+@@ -351,12 +395,12 @@ public class SwaggerDocParser implements DocParser {
+ 
+     private RefInfo getRefInfo(final JsonObject jsonObject, final SwaggerVersion version) {
+         JsonElement refElement;
+-        boolean isArray = Objects.nonNull(jsonObject.get("type")) && "array".equals(jsonObject.get("type").getAsString());
++        boolean isArray = Objects.nonNull(jsonObject.get(TYPE_KEY)) && "array".equals(jsonObject.get(TYPE_KEY).getAsString());
+         
+         if (isArray) {
+-            refElement = jsonObject.getAsJsonObject("items").get("$ref");
++            refElement = jsonObject.getAsJsonObject("items").get(REF_KEY);
+         } else {
+-            refElement = jsonObject.get("$ref");
++            refElement = jsonObject.get(REF_KEY);
+         }
+         
+         if (Objects.isNull(refElement)) {
+@@ -394,7 +438,7 @@ public class SwaggerDocParser implements DocParser {
+     private String extractBasePath(final JsonObject docRoot, final SwaggerVersion version) {
+         if (version == SwaggerVersion.V2) {
+             // Swagger 2.0: use basePath field
+-            return Optional.ofNullable(docRoot.get("basePath"))
++            return Optional.ofNullable(docRoot.get(BASE_PATH_KEY))
+                 .map(JsonElement::getAsString)
+                 .orElse("/");
+         } else {
+diff --git a/shenyu-admin/src/main/resources/mappers/api-sqlmap.xml b/shenyu-admin/src/main/resources/mappers/api-sqlmap.xml
+index 3c1f264..935c877 100644
+--- a/shenyu-admin/src/main/resources/mappers/api-sqlmap.xml
++++ b/shenyu-admin/src/main/resources/mappers/api-sqlmap.xml
+@@ -332,6 +332,15 @@
+     AND rpc_type = #{rpcType,jdbcType=VARCHAR}
+   </select>
+ 
++  <select id="lockIdsByPathAndRpcType" resultType="string" useCache="false">
++    SELECT id
++    FROM api
++    WHERE api_path = #{apiPath,jdbcType=VARCHAR}
++      AND rpc_type = #{rpcType,jdbcType=VARCHAR}
++    ORDER BY id
++    FOR UPDATE
++  </select>
++
+   <update id="updateOfflineByContextPath">
+     UPDATE
+         api
+diff --git a/shenyu-admin/src/test/java/org/apache/shenyu/admin/service/manager/impl/SwaggerSamePathImportDatabaseTest.java b/shenyu-admin/src/test/java/org/apache/shenyu/admin/service/manager/impl/SwaggerSamePathImportDatabaseTest.java
+new file mode 100644
+index 0000000..44a77a7
+--- /dev/null
++++ b/shenyu-admin/src/test/java/org/apache/shenyu/admin/service/manager/impl/SwaggerSamePathImportDatabaseTest.java
+@@ -0,0 +1,336 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.shenyu.admin.service.manager.impl;
++
++import com.google.gson.JsonObject;
++import com.google.gson.JsonParser;
++import jakarta.annotation.Resource;
++import org.apache.shiro.subject.Subject;
++import org.apache.shiro.util.ThreadContext;
++import org.apache.shenyu.admin.AbstractSpringIntegrationTest;
++import org.apache.shenyu.admin.model.bean.DocInfo;
++import org.apache.shenyu.admin.model.bean.UpstreamInstance;
++import org.apache.shenyu.admin.service.ApiService;
++import org.apache.shenyu.admin.service.manager.DocManager;
++import org.apache.shenyu.common.enums.ApiHttpMethodEnum;
++import org.junit.jupiter.api.Test;
++import org.junit.jupiter.params.ParameterizedTest;
++import org.junit.jupiter.params.provider.ValueSource;
++import org.springframework.jdbc.core.JdbcTemplate;
++
++import java.util.List;
++import java.util.Map;
++import java.util.Objects;
++import java.util.UUID;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicReference;
++
++import static org.apache.shenyu.common.constant.Constants.SYS_DEFAULT_NAMESPACE_ID;
++import static org.junit.jupiter.api.Assertions.assertAll;
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++class SwaggerSamePathImportDatabaseTest extends AbstractSpringIntegrationTest {
++
++    @Resource
++    private DocManager importer;
++
++    @Resource
++    private JdbcTemplate jdbc;
++
++    @Resource
++    private ApiService apiService;
++
++    @Test
++    void importsSeparateOperationsAndReimportsWithoutChangingAnotherMethod() {
++        final String fixture = "same-path-" + UUID.randomUUID();
++        final String path = "/" + fixture + "/orders";
++        final UpstreamInstance instance = instanceFor(fixture);
++        importSpec(instance, document(fixture, """
++                "patch":{"summary":"Existing operation","responses":{"200":{"description":"OK"}}}
++                """), null);
++        final List<Map<String, Object>> existing = rows(path, ApiHttpMethodEnum.PATCH);
++        assertEquals(1, existing.size());
++
++        final String initialDigest = importSpec(instance, document(fixture, """
++                "get":{"summary":"List orders","responses":{"200":{"description":"OK"}}},
++                "post":{"summary":"Place order","responses":{"201":{"description":"Created"}}}
++                """), null);
++        final List<String> initial = List.of(summary(path, ApiHttpMethodEnum.GET), summary(path, ApiHttpMethodEnum.POST));
++
++        final String afterDigest = importSpec(instance, document(fixture, """
++                "get":{"summary":"List orders again","responses":{"200":{"description":"OK"}}},
++                "post":{"summary":"Place order again","responses":{"201":{"description":"Created"}}}
++                """), initialDigest);
++        final List<String> after = List.of(summary(path, ApiHttpMethodEnum.GET), summary(path, ApiHttpMethodEnum.POST));
++        assertAll(
++                () -> assertNotEquals(initialDigest, afterDigest),
++                () -> assertEquals(List.of("List orders", "Place order"), initial),
++                () -> assertEquals(List.of("List orders again", "Place order again"), after),
++                () -> assertEquals(3, count(path)),
++                () -> assertEquals(1, rows(path, ApiHttpMethodEnum.GET).size()),
++                () -> assertEquals(1, rows(path, ApiHttpMethodEnum.POST).size()),
++                () -> assertEquals(existing, rows(path, ApiHttpMethodEnum.PATCH)));
++    }
++
++    @Test
++    void importsPutAndDeleteWithoutInventingGet() {
++        final String fixture = "same-path-" + UUID.randomUUID();
++        final String path = "/" + fixture + "/orders";
++        final UpstreamInstance instance = instanceFor(fixture);
++        importSpec(instance, document(fixture, """
++                "delete":{"summary":"Delete order","responses":{"204":{"description":"Removed"}}},
++                "put":{"summary":"Replace order","responses":{"200":{"description":"OK"}}}
++                """), null);
++        assertAll(
++                () -> assertEquals(2, count(path)),
++                () -> assertEquals("Delete order", summary(path, ApiHttpMethodEnum.DELETE)),
++                () -> assertEquals("Replace order", summary(path, ApiHttpMethodEnum.PUT)),
++                () -> assertEquals(0, rows(path, ApiHttpMethodEnum.GET).size()));
++    }
++
++    @Test
++    void leavesTheExistingRuleConditionWhenImportingAnotherMethodForThePath() {
++        final String fixture = "same-path-" + UUID.randomUUID();
++        final String path = "/" + fixture + "/orders";
++        final UpstreamInstance instance = instanceFor(fixture);
++        importSpec(instance, document(fixture, """
++                "post":{"summary":"Existing POST","responses":{"200":{"description":"OK"}}}
++                """), null);
++        final Object existingPostId = rows(path, ApiHttpMethodEnum.POST).get(0).get("id");
++        final String rule = seedRule(fixture, path);
++        importSpec(instance, document(fixture, """
++                "get":{"summary":"New GET","responses":{"200":{"description":"OK"}}},
++                "post":{"summary":"Updated POST","responses":{"200":{"description":"OK"}}}
++                """), null);
++        assertAll(
++                () -> assertEquals(List.of("existing"), jdbc.queryForList(
++                        "SELECT param_value FROM rule_condition WHERE rule_id = ?", String.class, rule)),
++                () -> assertEquals(existingPostId, rows(path, ApiHttpMethodEnum.POST).get(0).get("id")),
++                () -> assertEquals("Updated POST", summary(path, ApiHttpMethodEnum.POST)),
++                () -> assertEquals("New GET", summary(path, ApiHttpMethodEnum.GET)));
++    }
++
++    @Test
++    void preservesTheLegacySwagger2UploadRegistrationOnReimport() {
++        final String fixture = "same-path-" + UUID.randomUUID();
++        final String path = "/" + fixture + "/uploads";
++        final UpstreamInstance instance = instanceFor(fixture);
++        final String upload = """
++                "put":{"summary":"Replace file","consumes":["multipart/form-data"],
++                       "parameters":[{"name":"file","in":"formData","type":"file"}],"responses":{"200":{"description":"OK"}}}
++                """;
++        final String spec = """
++                {"swagger":"2.0","info":{"title":"File","version":"1.0"},"basePath":"/%s","paths":{"/uploads":{%s}}}
++                """;
++        importSpec(instance, spec.formatted(fixture, upload), null);
++        final List<Map<String, Object>> initial = rows(path, ApiHttpMethodEnum.POST);
++        assertEquals(1, initial.size());
++        importSpec(instance, spec.formatted(fixture, upload.replace("Replace file", "Replace file again")), null);
++        assertAll(
++                () -> assertEquals(initial.get(0).get("id"), rows(path, ApiHttpMethodEnum.POST).get(0).get("id")),
++                () -> assertEquals("Replace file again", summary(path, ApiHttpMethodEnum.POST)),
++                () -> assertEquals(0, rows(path, ApiHttpMethodEnum.PUT).size()));
++    }
++
++    @Test
++    void importsAnOperationWithALocalParameterReferenceAlongsideAnotherMethod() {
++        final String fixture = "same-path-" + UUID.randomUUID();
++        final String path = "/" + fixture + "/orders";
++        final UpstreamInstance instance = instanceFor(fixture);
++        importSpec(instance, """
++                {"openapi":"3.0.3","info":{"title":"Orders","version":"1.0"},
++                 "servers":[{"url":"/%s"}],
++                 "components":{"parameters":{"Tenant":{"name":"X-Tenant","in":"header","required":true,"schema":{"type":"string"}}}},
++                 "paths":{"/orders":{
++                   "get":{"summary":"List orders","responses":{"200":{"description":"OK"}}},
++                   "post":{"summary":"Place order","parameters":[{"$ref":"#/components/parameters/Tenant"}],
++                           "responses":{"201":{"description":"Created"}}}}}}
++                """.formatted(fixture), null);
++        assertEquals("List orders", summary(path, ApiHttpMethodEnum.GET));
++        assertEquals("Place order", summary(path, ApiHttpMethodEnum.POST));
++        final JsonObject header = JsonParser.parseString((String) rows(path, ApiHttpMethodEnum.POST).get(0).get("document"))
++                .getAsJsonObject().getAsJsonArray("requestHeaders").get(0).getAsJsonObject();
++        assertAll(
++                () -> assertEquals("X-Tenant", header.get("name").getAsString()),
++                () -> assertEquals("string", header.get("type").getAsString()),
++                () -> assertTrue(header.get("required").getAsBoolean()));
++    }
++
++    @Test
++    void deletingOneImportedMethodLeavesTheSharedRuleForTheOtherMethod() {
++        final String fixture = "same-path-" + UUID.randomUUID();
++        final String path = "/" + fixture + "/orders";
++        final UpstreamInstance instance = instanceFor(fixture);
++        importSpec(instance, document(fixture, """
++                "get":{"summary":"List orders","responses":{"200":{"description":"OK"}}},
++                "post":{"summary":"Place order","responses":{"201":{"description":"Created"}}}
++                """), null);
++        final String rule = seedRule(fixture, path);
++        final Subject previous = ThreadContext.getSubject();
++        final Subject administrator = mock(Subject.class);
++        when(administrator.isPermitted("system:plugin:delete")).thenReturn(true);
++        ThreadContext.bind(administrator);
++        try {
++            apiService.delete(List.of((String) rows(path, ApiHttpMethodEnum.GET).get(0).get("id")));
++            assertAll(
++                    () -> assertEquals(0, rows(path, ApiHttpMethodEnum.GET).size()),
++                    () -> assertEquals("Place order", summary(path, ApiHttpMethodEnum.POST)),
++                    () -> assertEquals(List.of("existing"), jdbc.queryForList(
++                            "SELECT param_value FROM rule_condition WHERE rule_id = ?", String.class, rule)));
++            apiService.delete(List.of((String) rows(path, ApiHttpMethodEnum.POST).get(0).get("id")));
++            assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM rule WHERE id = ?", Integer.class, rule));
++        } finally {
++            ThreadContext.unbindSubject();
++            if (Objects.nonNull(previous)) {
++                ThreadContext.bind(previous);
++            }
++        }
++    }
++
++    @Test
++    void deletingMethodsConcurrentlyCleansTheSharedRule() throws Exception {
++        final String fixture = "same-path-" + UUID.randomUUID();
++        final String path = "/" + fixture + "/orders";
++        final UpstreamInstance instance = instanceFor(fixture);
++        importSpec(instance, document(fixture, """
++                "get":{"summary":"List orders","responses":{"200":{"description":"OK"}}},
++                "post":{"summary":"Place order","responses":{"201":{"description":"Created"}}}
++                """), null);
++        final String rule = seedRule(fixture, path);
++        final String getId = (String) rows(path, ApiHttpMethodEnum.GET).get(0).get("id");
++        final String postId = (String) rows(path, ApiHttpMethodEnum.POST).get(0).get("id");
++        final CountDownLatch ready = new CountDownLatch(2);
++        final CountDownLatch start = new CountDownLatch(1);
++        final ExecutorService workers = Executors.newFixedThreadPool(2);
++        try {
++            final Future<?> first = workers.submit(() -> deleteAsAdministrator(getId, ready, start));
++            final Future<?> second = workers.submit(() -> deleteAsAdministrator(postId, ready, start));
++            assertTrue(ready.await(5, TimeUnit.SECONDS));
++            start.countDown();
++            first.get(10, TimeUnit.SECONDS);
++            second.get(10, TimeUnit.SECONDS);
++            assertEquals(0, count(path));
++            assertEquals(0, jdbc.queryForObject("SELECT count(*) FROM rule WHERE id = ?", Integer.class, rule));
++        } finally {
++            workers.shutdownNow();
++        }
++    }
++
++    private void deleteAsAdministrator(final String id, final CountDownLatch ready, final CountDownLatch start) {
++        final Subject administrator = mock(Subject.class);
++        when(administrator.isPermitted("system:plugin:delete")).thenReturn(true);
++        ThreadContext.bind(administrator);
++        try {
++            ready.countDown();
++            assertTrue(start.await(5, TimeUnit.SECONDS));
++            apiService.delete(List.of(id));
++        } catch (InterruptedException ex) {
++            Thread.currentThread().interrupt();
++            throw new AssertionError(ex);
++        } finally {
++            ThreadContext.unbindSubject();
++        }
++    }
++
++    @ParameterizedTest
++    @ValueSource(booleans = {true, false})
++    void distinguishesTheLegacyPlaceholderFromARealGet(final boolean legacy) {
++        final String fixture = "same-path-" + UUID.randomUUID();
++        final String path = "/" + fixture + "/orders";
++        final UpstreamInstance instance = instanceFor(fixture);
++        importSpec(instance, document(fixture, """
++                "get":{"summary":"Existing document","responses":{"200":{"description":"OK"}}}
++                """), null);
++        final Map<String, Object> original = rows(path, ApiHttpMethodEnum.GET).get(0);
++        final String rule = seedRule(fixture, path);
++        if (legacy) {
++            final JsonObject legacyDoc = JsonParser.parseString((String) original.get("document")).getAsJsonObject();
++            legacyDoc.add("httpMethodList", JsonParser.parseString("[\"delete\",\"put\"]"));
++            jdbc.update("UPDATE api SET document = ? WHERE id = ?", legacyDoc.toString(), original.get("id"));
++        }
++        importSpec(instance, document(fixture, """
++                "delete":{"summary":"Delete order","responses":{"204":{"description":"Removed"}}},
++                "put":{"summary":"Replace order","responses":{"200":{"description":"OK"}}}
++                """), null);
++        assertAll(
++                () -> assertEquals(legacy ? List.of() : List.of(original), rows(path, ApiHttpMethodEnum.GET)),
++                () -> assertEquals("Delete order", summary(path, ApiHttpMethodEnum.DELETE)),
++                () -> assertEquals("Replace order", summary(path, ApiHttpMethodEnum.PUT)),
++                () -> assertEquals(List.of("existing"), jdbc.queryForList(
++                        "SELECT param_value FROM rule_condition WHERE rule_id = ?", String.class, rule)));
++    }
++
++    private UpstreamInstance instanceFor(final String fixture) {
++        final UpstreamInstance instance = new UpstreamInstance();
++        instance.setContextPath("/" + fixture);
++        instance.setIp("127.0.0.1");
++        instance.setPort(8190);
++        return instance;
++    }
++
++    private String seedRule(final String fixture, final String path) {
++        final String pluginId = jdbc.queryForObject("SELECT id FROM plugin WHERE name = 'divide'", String.class);
++        final String selector = fixture + "-selector";
++        final String rule = fixture + "-rule";
++        jdbc.update("INSERT INTO selector (id, plugin_id, selector_name, match_mode, selector_type, sort_code, "
++                        + "handle, enabled, logged, continued, match_restful, namespace_id) "
++                        + "VALUES (?, ?, ?, 0, 1, 1, '{}', true, false, false, false, ?)",
++                selector, pluginId, "/" + fixture, SYS_DEFAULT_NAMESPACE_ID);
++        jdbc.update("INSERT INTO rule (id, selector_id, rule_name, match_mode, sort_code, handle, enabled, logged, match_restful, namespace_id) "
++                        + "VALUES (?, ?, ?, 0, 1, '{}', true, false, false, ?)", rule, selector, path, SYS_DEFAULT_NAMESPACE_ID);
++        jdbc.update("INSERT INTO rule_condition (id, rule_id, param_type, operator, param_name, param_value) "
++                        + "VALUES (?, ?, 'header', '=', 'X-Shop', 'existing')", fixture + "-condition", rule);
++        return rule;
++    }
++
++    private String importSpec(final UpstreamInstance instance, final String body, final String previousDigest) {
++        AtomicReference<String> digest = new AtomicReference<>();
++        importer.addDocInfo(instance, body, previousDigest, (DocInfo info) -> digest.set(info.getDocMd5()));
++        assertNotNull(digest.get());
++        return digest.get();
++    }
++
++    private String document(final String fixture, final String operations) {
++        return """
++                {"openapi":"3.0.3","info":{"title":"Orders","version":"1.0"},
++                 "servers":[{"url":"/%s"}],"paths":{"/orders":{%s}}}
++                """.formatted(fixture, operations);
++    }
++
++    private List<Map<String, Object>> rows(final String path, final ApiHttpMethodEnum method) {
++        return jdbc.queryForList("select id, document from api where api_path = ? and http_method = ?", path, method.getValue());
++    }
++
++    private int count(final String path) {
++        return jdbc.queryForObject("select count(*) from api where api_path = ?", Integer.class, path);
++    }
++
++    private String summary(final String path, final ApiHttpMethodEnum method) {
++        List<String> documents = jdbc.queryForList("select document from api where api_path = ? and http_method = ?", String.class, path, method.getValue());
++        return documents.size() == 1 ? JsonParser.parseString(documents.get(0)).getAsJsonObject().get("summary").getAsString() : "missing-or-duplicate";
++    }
++}
+diff --git a/shenyu-admin/src/test/java/org/apache/shenyu/admin/service/manager/impl/SwaggerSamePathOperationsRegistrationTest.java b/shenyu-admin/src/test/java/org/apache/shenyu/admin/service/manager/impl/SwaggerSamePathOperationsRegistrationTest.java
+new file mode 100644
+index 0000000..e2914ac
+--- /dev/null
++++ b/shenyu-admin/src/test/java/org/apache/shenyu/admin/service/manager/impl/SwaggerSamePathOperationsRegistrationTest.java
+@@ -0,0 +1,99 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.shenyu.admin.service.manager.impl;
++
++import org.apache.shenyu.admin.model.bean.DocItem;
++import org.apache.shenyu.admin.model.bean.UpstreamInstance;
++import org.apache.shenyu.admin.model.dto.ApiDTO;
++import org.apache.shenyu.admin.model.vo.TagVO;
++import org.apache.shenyu.admin.service.ApiService;
++import org.apache.shenyu.admin.service.TagService;
++import org.apache.shenyu.common.enums.ApiHttpMethodEnum;
++import org.apache.shenyu.common.enums.RpcTypeEnum;
++import org.apache.shenyu.common.utils.GsonUtils;
++import org.junit.jupiter.api.Test;
++import org.springframework.test.util.ReflectionTestUtils;
++
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++
++import static org.junit.jupiter.api.Assertions.assertAll;
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.mockito.ArgumentMatchers.any;
++import static org.mockito.ArgumentMatchers.anyInt;
++import static org.mockito.ArgumentMatchers.anyString;
++import static org.mockito.Mockito.doAnswer;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++class SwaggerSamePathOperationsRegistrationTest {
++
++    @Test
++    void keepsDistinctOperationsAndLeavesOtherMethodsUntouchedAcrossRepeatedImports() {
++        final String body = """
++                {"openapi":"3.0.3","info":{"title":"Orders","version":"1.0"},
++                 "servers":[{"url":"/shop"}],
++                 "paths":{"/orders":{
++                    "get":{"summary":"List orders","responses":{"200":{"description":"OK"}}},
++                    "post":{"summary":"Place order","responses":{"201":{"description":"Created"}}}
++                 }}}
++                """;
++        ApiService apiService = mock(ApiService.class);
++        TagService tagService = mock(TagService.class);
++        TagVO tag = mock(TagVO.class);
++        when(tag.getId()).thenReturn("tag-orders");
++        when(tagService.findByQuery(anyString())).thenReturn(List.of(tag));
++        RegisterApiDocServiceImpl register = new RegisterApiDocServiceImpl();
++        ReflectionTestUtils.setField(register, "apiService", apiService);
++        ReflectionTestUtils.setField(register, "tagService", tagService);
++        DocManagerImpl importer = new DocManagerImpl();
++        ReflectionTestUtils.setField(importer, "registerApiDocService", register);
++        UpstreamInstance instance = new UpstreamInstance();
++        instance.setContextPath("/shop");
++        instance.setIp("127.0.0.1");
++        instance.setPort(8190);
++
++        final Integer get = ApiHttpMethodEnum.GET.getValue();
++        final Integer post = ApiHttpMethodEnum.POST.getValue();
++        Integer put = ApiHttpMethodEnum.PUT.getValue();
++        Map<Integer, String> registeredSummaries = new LinkedHashMap<>();
++        registeredSummaries.put(put, "Manually managed operation");
++        doAnswer(invocation -> {
++            assertEquals("/shop/orders", invocation.getArgument(0));
++            assertEquals(RpcTypeEnum.HTTP.getName(), invocation.getArgument(2));
++            registeredSummaries.remove(invocation.<Integer>getArgument(1));
++            return null;
++        }).when(apiService).deleteByApiPathHttpMethodRpcType(anyString(), anyInt(), anyString());
++        when(apiService.createOrUpdate(any(ApiDTO.class))).thenAnswer(invocation -> {
++            ApiDTO api = invocation.getArgument(0);
++            DocItem document = GsonUtils.getInstance().fromJson(api.getDocument(), DocItem.class);
++            registeredSummaries.put(api.getHttpMethod(), document.getSummary());
++            return "saved";
++        });
++
++        importer.addDocInfo(instance, body, null, info -> { });
++        importer.addDocInfo(instance, body, null, info -> { });
++
++        assertAll(
++                () -> assertEquals(3, registeredSummaries.size()),
++                () -> assertEquals("List orders", registeredSummaries.get(get)),
++                () -> assertEquals("Place order", registeredSummaries.get(post)),
++                () -> assertEquals("Manually managed operation", registeredSummaries.get(put)));
++    }
++}
