@@ -6,6 +6,7 @@ permissions:
   contents: read
 jobs:
   mysql:
+    if: github.repository == 'wozhenbang2004/shenyu'
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
