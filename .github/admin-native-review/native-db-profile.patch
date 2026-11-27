@@ -1,0 +1,66 @@
+--- a/shenyu-admin/src/test/java/org/apache/shenyu/admin/AbstractSpringIntegrationTest.java
++++ b/shenyu-admin/src/test/java/org/apache/shenyu/admin/AbstractSpringIntegrationTest.java
+@@ -17,15 +17,62 @@
+ 
+ package org.apache.shenyu.admin;
+ 
++import jakarta.annotation.Resource;
++import org.junit.jupiter.api.BeforeEach;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
+ import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.test.context.ActiveProfilesResolver;
++
++import javax.sql.DataSource;
++import java.sql.Connection;
++import java.sql.SQLException;
++import java.util.Objects;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
+ import org.springframework.test.context.ActiveProfiles;
+ 
+ /**
+  * Abstract Integration Test for Spring.
+  */
+-@ActiveProfiles("h2")
++@ActiveProfiles(resolver = AbstractSpringIntegrationTest.NativeAdminProfiles.class)
+ @SpringBootTest(classes = ShenyuAdminBootstrap.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+         properties = "spring.autoconfigure.exclude=org.springframework.boot.actuate.autoconfigure.jdbc.DataSourceHealthContributorAutoConfiguration")
+ public abstract class AbstractSpringIntegrationTest {
+ 
++    private static final Logger LOG = LoggerFactory.getLogger(AbstractSpringIntegrationTest.class);
++
++    @Resource
++    private DataSource dataSource;
++
++    @BeforeEach
++    protected void verifyNativeAdminDatabase() throws SQLException {
++        String selected = System.getenv("SHENYU_NATIVE_ADMIN_PROFILE");
++        if (Objects.isNull(selected) || "h2".equals(selected)) {
++            return;
++        }
++        try (Connection connection = dataSource.getConnection()) {
++            String actual = connection.getMetaData().getDatabaseProductName();
++            String expected = "mysql".equals(selected) ? "MySQL" : "PostgreSQL";
++            assertEquals(expected, actual);
++            assertEquals("shenyu", connection.getCatalog());
++            LOG.info("Native Admin JDBC product: {}", actual);
++        }
++    }
++
++    /** Read only the test harness opt-in and preserve the default H2 profile. */
++    public static final class NativeAdminProfiles implements ActiveProfilesResolver {
++
++        @Override
++        public String[] resolve(final Class<?> testClass) {
++            String selected = System.getenv("SHENYU_NATIVE_ADMIN_PROFILE");
++            if (Objects.isNull(selected) || "h2".equals(selected)) {
++                return new String[]{"h2"};
++            }
++            if (!"mysql".equals(selected) && !"pg".equals(selected)) {
++                throw new IllegalArgumentException("Native Admin profile must be mysql or pg");
++            }
++            return new String[]{selected};
++        }
++    }
+ }

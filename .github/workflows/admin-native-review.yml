@@ -1,0 +1,38 @@
+name: Admin native MySQL review
+on:
+  push:
+    branches: [verify/admin-native-mysql]
+permissions:
+  contents: read
+jobs:
+  mysql:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: review
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 9a739f5bf1e29d9ccda68f277a7a51d5ccf2afd0
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Verify checksums and compare the base and patched MySQL behavior
+        working-directory: source
+        run: |
+          set -euo pipefail
+          overlay="$GITHUB_WORKSPACE/review/.github/admin-native-review"
+          (cd "$overlay" && sha256sum -c SHA256SUMS)
+          python3 "$overlay/run-native-admin.py" mysql "$overlay/tag-pagination.patch" "$overlay/mock-bounded.patch" "$RUNNER_TEMP/mysql-evidence"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-mysql-evidence
+          path: ${{ runner.temp }}/mysql-evidence
+          if-no-files-found: warn
+          retention-days: 5
