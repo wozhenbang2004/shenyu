@@ -1,0 +1,79 @@
+name: ShenYu 8651 native MySQL
+on:
+  push:
+    branches: [verify/shenyu-8651-native-mysql]
+permissions:
+  contents: read
+jobs:
+  mysql:
+    if: github.repository == 'wozhenbang2004/shenyu'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      mysql:
+        image: mysql:8.0@sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b
+        env:
+          MYSQL_ROOT_PASSWORD: shenyu_ci_fixture
+          MYSQL_ROOT_HOST: '%'
+        ports:
+          - 3306/tcp
+        options: >-
+          --health-cmd="mysqladmin ping -h127.0.0.1 -uroot -pshenyu_ci_fixture"
+          --health-interval=5s --health-timeout=5s --health-retries=30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: review
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: apache/shenyu
+          ref: 562bfa671193b332e9e4d62f115cb661e43e7a3b
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Run Admin import and concurrent deletion on real MySQL
+        shell: bash
+        working-directory: source
+        env:
+          MYSQL_CONTAINER: ${{ job.services.mysql.id }}
+          SHENYU_NATIVE_ADMIN_PROFILE: mysql
+          SPRING_PROFILES_ACTIVE: mysql
+          SPRING_DATASOURCE_URL: jdbc:mysql://127.0.0.1:${{ job.services.mysql.ports[3306] }}/shenyu?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+          SPRING_DATASOURCE_USERNAME: root
+          SPRING_DATASOURCE_PASSWORD: shenyu_ci_fixture
+        run: |
+          set -euo pipefail
+          overlay="$GITHUB_WORKSPACE/review/.github/verify-8651"
+          test "$(git rev-parse HEAD)" = 562bfa671193b332e9e4d62f115cb661e43e7a3b
+          printf '%s  %s\n' '474f9667c97d6a74c30567580f63a2f5e639d947abac1a181f8c48577f90582b' "$overlay/candidate.patch" | sha256sum -c -
+          git apply --check "$overlay/candidate.patch" "$overlay/profile.patch"
+          git apply "$overlay/candidate.patch" "$overlay/profile.patch"
+          docker exec -i "$MYSQL_CONTAINER" mysql -uroot -pshenyu_ci_fixture < db/init/mysql/schema.sql
+          docker exec "$MYSQL_CONTAINER" mysql -uroot -pshenyu_ci_fixture -e "SELECT @@version, @@transaction_isolation; SHOW TABLE STATUS FROM shenyu LIKE 'api';"
+          ./mvnw -B -ntp -pl shenyu-admin -am test -Dtest=SwaggerSamePathImportDatabaseTest \
+            -Dsurefire.failIfNoSpecifiedTests=false -Dshenyu.database.init_enable=false \
+            -Dmaven.javadoc.skip=true 2>&1 | tee "$RUNNER_TEMP/mysql-8651.log"
+          grep -F 'Native Admin JDBC product: MySQL' "$RUNNER_TEMP/mysql-8651.log"
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          report = next(Path('shenyu-admin/target/surefire-reports').glob('TEST-*SwaggerSamePathImportDatabaseTest.xml'))
+          root = ET.parse(report).getroot()
+          for key in ('errors', 'failures', 'skipped'):
+              assert root.attrib[key] == '0', root.attrib
+          assert any(c.attrib['name'] == 'deletingMethodsConcurrentlyCleansTheSharedRule' for c in root.findall('testcase'))
+          print('Verified concurrent deletion and Admin integration against MySQL:', root.attrib['tests'])
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mysql-8651-results
+          path: |
+            ${{ runner.temp }}/mysql-8651.log
+            source/shenyu-admin/target/surefire-reports/TEST-*SwaggerSamePathImportDatabaseTest.xml
+          if-no-files-found: warn
+          retention-days: 7
